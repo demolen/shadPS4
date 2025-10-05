@@ -109,9 +109,6 @@ public:
     /// Writes a value to GPU buffer.
     void InlineData(VAddr address, const void* value, u32 num_bytes, bool is_gds);
 
-    /// Writes a value to GPU buffer. (uses staging buffer to temporarily store the data)
-    void WriteData(VAddr address, const void* value, u32 num_bytes, bool is_gds);
-
     /// Performs buffer to buffer data copy on the GPU.
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
 

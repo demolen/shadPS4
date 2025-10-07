@@ -6,6 +6,8 @@
 #include <shared_mutex>
 #include <boost/container/small_vector.hpp>
 #include "common/div_ceil.h"
+#include <tsl/robin_map.h>
+
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -40,12 +42,8 @@ public:
     static constexpr u64 CACHING_PAGESIZE = u64{1} << CACHING_PAGEBITS;
     static constexpr u64 DEVICE_PAGESIZE = 4_KB;
 
-    struct PageData {
-        BufferId buffer_id{};
-    };
-
     struct Traits {
-        using Entry = PageData;
+        using Entry = BufferId;
         static constexpr size_t AddressSpaceBits = 40;
         static constexpr size_t FirstLevelBits = 14;
         static constexpr size_t PageBits = CACHING_PAGEBITS;
@@ -81,6 +79,11 @@ public:
         return slot_buffers[id];
     }
 
+    /// Retrieves GPU modified ranges since last CPU fence that haven't been read protected yet.
+    [[nodiscard]] RangeSet& GetPendingGpuModifiedRanges() {
+        return gpu_modified_ranges_pending;
+    }
+
     /// Retrieves a utility buffer optimized for specified memory usage.
     StreamBuffer& GetUtilityBuffer(MemoryUsage usage) noexcept {
         if (usage == MemoryUsage::Stream) {
@@ -113,30 +116,38 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
 
     /// Obtains a buffer for the specified region.
-    [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
-                                                       bool is_texel_buffer = false,
-                                                       BufferId buffer_id = {});
+    std::pair<Buffer*, u32> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
+                                         bool is_texel_buffer = false, BufferId buffer_id = {});
 
     /// Attempts to obtain a buffer without modifying the cache contents.
-    [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
+    std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
 
     /// Return true when a region is registered on the cache
-    [[nodiscard]] bool IsRegionRegistered(VAddr addr, size_t size);
+    bool IsRegionRegistered(VAddr addr, size_t size);
 
     /// Return true when a CPU region is modified from the CPU
-    [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
+    bool IsRegionCpuModified(VAddr addr, size_t size);
 
     /// Return true when a CPU region is modified from the GPU
-    [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+    bool IsRegionGpuModified(VAddr addr, size_t size);
 
     [[nodiscard]] BufferId FindBuffer(VAddr device_addr, u32 size);
+
+    /// Processes ready preemptive downloads not consumed by the guest.
+    void ProcessPreemptiveDownloads();
+
+    /// Synchronizes all buffers in the specified range.
+    void SynchronizeBuffersInRange(VAddr device_addr, u64 size, bool is_written = false);
+
+    /// Notifies memory tracker of GPU modified ranges from the last CPU fence.
+    void CommitPendingGpuRanges();
 
 private:
     template <typename Func>
     void ForEachBufferInRange(VAddr device_addr, u64 size, Func&& func) {
         const u64 page_end = Common::DivCeil(device_addr + size, CACHING_PAGESIZE);
         for (u64 page = device_addr >> CACHING_PAGEBITS; page < page_end;) {
-            const BufferId buffer_id = page_table[page].buffer_id;
+            const BufferId buffer_id = page_table[page];
             if (!buffer_id) {
                 ++page;
                 continue;
@@ -168,13 +179,13 @@ private:
     template <bool insert>
     void ChangeRegister(BufferId buffer_id);
 
-    bool SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
+    bool SynchronizeBuffer(const Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
-    vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+    vk::Buffer UploadCopies(const Buffer& buffer, std::span<vk::BufferCopy> copies,
                             size_t total_size_bytes);
 
-    bool SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size);
+    bool SynchronizeBufferFromImage(const Buffer& buffer, VAddr device_addr, u32 size);
 
     void InlineDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes);
 
@@ -196,6 +207,18 @@ private:
     std::shared_mutex mutex;
     Common::SlotVector<Buffer> slot_buffers;
     RangeSet gpu_modified_ranges;
+    RangeSet gpu_modified_ranges_pending;
+    struct PreemptiveDownload {
+        VAddr device_addr;
+        u64 size;
+        u8* staging;
+        u64 done_tick;
+
+        auto operator<=>(const PreemptiveDownload&) const = default;
+    };
+    SplitRangeMap<PreemptiveDownload> preemptive_downloads;
+    using BufferCopies = boost::container::small_vector<vk::BufferCopy, 8>;
+    tsl::robin_map<BufferId, BufferCopies> preemptive_copies;
     PageTable page_table;
 };
 

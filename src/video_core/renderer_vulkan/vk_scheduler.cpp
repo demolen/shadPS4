@@ -64,6 +64,11 @@ void Scheduler::Flush(SubmitInfo& info) {
     SubmitExecution(info);
 }
 
+void Scheduler::Flush() {
+    SubmitInfo info{};
+    Flush(info);
+}
+
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
